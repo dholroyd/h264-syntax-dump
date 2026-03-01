@@ -1,0 +1,8 @@
+[package]
+name = "h264-syntax-dump"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+h264-reader = { path = "../h264-reader" }
+mpeg-syntax-dump = { path = "../mpeg-syntax-dump" }
