@@ -18,7 +18,7 @@ use h264_syntax_dump::{
     AudDescribe, PpsDescribe, SeiPayloadDescribe, SliceHeaderDescribe, SpsDescribe,
     SpsExtensionDescribe, SubsetSpsDescribe,
 };
-use mpeg_syntax_dump::{AnsiRenderer, SyntaxDescribe, SyntaxWrite};
+use mpeg_syntax_dump::{AnsiRenderer, CompactTextRenderer, SyntaxDescribe, SyntaxWrite};
 
 struct NalCollector(Vec<Vec<u8>>);
 
@@ -35,28 +35,26 @@ impl AccumulatedNalHandler for &mut NalCollector {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <file.264>", args[0]);
-        process::exit(1);
-    }
-    let filename = &args[1];
+    let compact = args.iter().any(|a| a == "--compact");
+    let filename = args.iter().find(|a| !a.starts_with('-') && *a != &args[0]);
+    let filename = match filename {
+        Some(f) => f.clone(),
+        None => {
+            eprintln!("Usage: {} [--compact] <file.264>", args[0]);
+            process::exit(1);
+        }
+    };
 
-    if let Err(e) = run(filename) {
+    if let Err(e) = run(&filename, compact) {
         eprintln!("Error: {e}");
         process::exit(1);
     }
 }
 
-fn run(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run(filename: &str, compact: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = File::open(filename)?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
-
-    let stdout = io::stdout();
-    let mut renderer = AnsiRenderer::new(io::BufWriter::new(stdout.lock()));
-
-    let mut ctx = Context::new();
-    let mut sei_scratch = Vec::new();
 
     // Collect complete NALs by pushing data through the Annex B parser.
     let mut collector = NalCollector(Vec::new());
@@ -67,13 +65,32 @@ fn run(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     let nals = collector.0;
 
+    let stdout = io::stdout();
+    if compact {
+        let mut renderer = CompactTextRenderer::new(io::BufWriter::new(stdout.lock()));
+        describe_nals(&nals, &mut renderer)?;
+    } else {
+        let mut renderer = AnsiRenderer::new(io::BufWriter::new(stdout.lock()));
+        describe_nals(&nals, &mut renderer)?;
+    }
+
+    Ok(())
+}
+
+fn describe_nals<W: SyntaxWrite<Error: 'static>>(
+    nals: &[Vec<u8>],
+    renderer: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ctx = Context::new();
+    let mut sei_scratch = Vec::new();
+
     for (idx, nal_bytes) in nals.iter().enumerate() {
         let context = format!("NAL #{} ({} bytes)", idx + 1, nal_bytes.len());
         describe_nal(
             nal_bytes,
             &context,
             &mut ctx,
-            &mut renderer,
+            renderer,
             &mut sei_scratch,
         )?;
     }

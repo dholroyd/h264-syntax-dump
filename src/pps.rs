@@ -1,7 +1,8 @@
 use h264_reader::nal::pps::{SliceGroup, SliceGroupChangeType};
-use h264_reader::nal::sps::{ChromaFormat, ScalingList, SeqParameterSet};
+use h264_reader::nal::sps::{ChromaFormat, ScalingLists8x8, SeqParameterSet};
 use mpeg_syntax_dump::{
-    FixedWidthField, SyntaxDescribe, SyntaxWrite, TermAnnotation, Value, VariableLengthField,
+    ColumnDef, FieldTable, FixedWidthField, SyntaxDescribe, SyntaxWrite, TermAnnotation, Value,
+    VariableLengthField,
 };
 
 use crate::PpsDescribe;
@@ -263,23 +264,16 @@ fn describe_slice_groups<W: SyntaxWrite>(
         is_0,
     )?;
     if let SliceGroup::Interleaved { run_length_minus1 } = sg {
-        w.begin_for(
-            "iGroup = 0; iGroup <= num_slice_groups_minus1; iGroup++",
-            &[TermAnnotation {
-                name: "num_slice_groups_minus1",
-                value: Value::Unsigned(num_sg_minus1 as u64),
-            }],
-        )?;
-        for (i, rl) in run_length_minus1.iter().enumerate() {
-            w.for_iteration("iGroup", i as u64)?;
-            w.variable_length_field(&VariableLengthField {
-                name: &format!("run_length_minus1[{i}]"),
-                descriptor: "ue(v)",
-                value: Some(Value::Unsigned(*rl as u64)),
-                comment: None,
-            })?;
-        }
-        w.end_for()?;
+        let rows: Vec<[Value; 1]> = run_length_minus1.iter()
+            .map(|&rl| [Value::Unsigned(rl as u64)])
+            .collect();
+        let row_refs: Vec<&[Value]> = rows.iter().map(|r| r.as_slice()).collect();
+        w.field_table(&FieldTable {
+            columns: &[
+                ColumnDef { name: "run_length_minus1", descriptor: "ue(v)", bits: None },
+            ],
+            rows: &row_refs,
+        })?;
     }
 
     // else if (slice_group_map_type == 2)
@@ -392,12 +386,17 @@ fn describe_pic_scaling_matrix<W: SyntaxWrite>(
         }],
     )?;
 
+    let lists8x8 = psm.scaling_lists8x8.as_ref().map(|l| match l {
+        ScalingLists8x8::Y(a) => a.as_slice(),
+        ScalingLists8x8::YCbCr(a) => a.as_slice(),
+    });
+
     for i in 0..total {
         w.for_iteration("i", i as u64)?;
 
         if i < 6 {
-            let list = psm.scaling_list4x4.get(i as usize);
-            let present = list.is_some_and(|l| !matches!(l, ScalingList::NotPresent));
+            let list = psm.scaling_lists4x4.0.get(i as usize).and_then(|o| o.as_ref());
+            let present = list.is_some();
             w.fixed_width_field(&FixedWidthField {
                 name: &format!("pic_scaling_list_present_flag[{i}]"),
                 bits: 1,
@@ -406,15 +405,14 @@ fn describe_pic_scaling_matrix<W: SyntaxWrite>(
                 comment: None,
             })?;
             w.begin_if(&format!("pic_scaling_list_present_flag[{i}]"), &[], present)?;
-            if present
-                && let Some(list) = list {
-                    crate::sps::describe_scaling_list_4x4(w, list, i as u32)?;
-                }
+            if let Some(list) = list {
+                crate::sps::describe_scaling_list_4x4(w, list, i as u32)?;
+            }
             w.end_if()?;
         } else {
             let idx = (i - 6) as usize;
-            let list = psm.scaling_list8x8.as_ref().and_then(|v| v.get(idx));
-            let present = list.is_some_and(|l| !matches!(l, ScalingList::NotPresent));
+            let list = lists8x8.as_ref().and_then(|v| v.get(idx)).and_then(|o| o.as_ref());
+            let present = list.is_some();
             w.fixed_width_field(&FixedWidthField {
                 name: &format!("pic_scaling_list_present_flag[{i}]"),
                 bits: 1,
@@ -423,10 +421,9 @@ fn describe_pic_scaling_matrix<W: SyntaxWrite>(
                 comment: None,
             })?;
             w.begin_if(&format!("pic_scaling_list_present_flag[{i}]"), &[], present)?;
-            if present
-                && let Some(list) = list {
-                    crate::sps::describe_scaling_list_8x8(w, list, i as u32)?;
-                }
+            if let Some(list) = list {
+                crate::sps::describe_scaling_list_8x8(w, list, i as u32)?;
+            }
             w.end_if()?;
         }
     }

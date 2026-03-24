@@ -1,8 +1,6 @@
-use std::num::NonZeroU8;
-
 use h264_reader::nal::sps::{
     AspectRatioInfo, ChromaInfo, FrameMbsFlags, HrdParameters, OverscanAppropriate,
-    PicOrderCntType, ScalingList, SeqScalingMatrix, VuiParameters,
+    PicOrderCntType, ScalingLists8x8, SeqScalingMatrix, VuiParameters,
 };
 use mpeg_syntax_dump::{
     FixedWidthField, SyntaxDescribe, SyntaxWrite, TermAnnotation, Value, VariableLengthField,
@@ -326,13 +324,18 @@ fn describe_seq_scaling_matrix<W: SyntaxWrite>(
             value: Value::Unsigned(chroma_format_idc as u64),
         }],
     )?;
+    let lists8x8 = match &matrix.scaling_lists8x8 {
+        ScalingLists8x8::Y(a) => a.as_slice(),
+        ScalingLists8x8::YCbCr(a) => a.as_slice(),
+    };
+
     for i in 0..count {
         w.for_iteration("i", i as u64)?;
 
         if i < 6 {
             // 4x4 scaling list
-            let list = matrix.scaling_list4x4.get(i as usize);
-            let present = list.is_some_and(|l| !matches!(l, ScalingList::NotPresent));
+            let list = matrix.scaling_lists4x4.0.get(i as usize).and_then(|o| o.as_ref());
+            let present = list.is_some();
             w.fixed_width_field(&FixedWidthField {
                 name: &format!("seq_scaling_list_present_flag[{i}]"),
                 bits: 1,
@@ -341,16 +344,15 @@ fn describe_seq_scaling_matrix<W: SyntaxWrite>(
                 comment: None,
             })?;
             w.begin_if(&format!("seq_scaling_list_present_flag[{i}]"), &[], present)?;
-            if present
-                && let Some(list) = list {
-                    describe_scaling_list_4x4(w, list, i)?;
-                }
+            if let Some(list) = list {
+                describe_scaling_list_4x4(w, list, i)?;
+            }
             w.end_if()?;
         } else {
             // 8x8 scaling list
             let idx = (i - 6) as usize;
-            let list = matrix.scaling_list8x8.get(idx);
-            let present = list.is_some_and(|l| !matches!(l, ScalingList::NotPresent));
+            let list = lists8x8.get(idx).and_then(|o| o.as_ref());
+            let present = list.is_some();
             w.fixed_width_field(&FixedWidthField {
                 name: &format!("seq_scaling_list_present_flag[{i}]"),
                 bits: 1,
@@ -359,19 +361,23 @@ fn describe_seq_scaling_matrix<W: SyntaxWrite>(
                 comment: None,
             })?;
             w.begin_if(&format!("seq_scaling_list_present_flag[{i}]"), &[], present)?;
-            if present
-                && let Some(list) = list {
-                    describe_scaling_list_8x8(w, list, i)?;
-                }
+            if let Some(list) = list {
+                describe_scaling_list_8x8(w, list, i)?;
+            }
             w.end_if()?;
         }
     }
     w.end_for()
 }
 
+/// Describe a 4x4 scaling list from its `next_scale` array.
+///
+/// The array contains `next_scale` intermediate values (see H.264 spec 7.3.2.1.1).
+/// A value of `0` at position `j` means the list was frozen; `0` at position 0
+/// means "use default scaling matrix".
 pub(crate) fn describe_scaling_list_4x4<W: SyntaxWrite>(
     w: &mut W,
-    list: &ScalingList<16>,
+    scales: &[u8; 16],
     index: u32,
 ) -> Result<(), W::Error> {
     w.begin_element(
@@ -380,13 +386,14 @@ pub(crate) fn describe_scaling_list_4x4<W: SyntaxWrite>(
             "ScalingList4x4[{index}], 16, UseDefaultScalingMatrix4x4Flag[{index}]"
         )),
     )?;
-    describe_scaling_list_body::<W, 16>(w, list)?;
+    describe_scaling_list_body::<W, 16>(w, scales)?;
     w.end_element()
 }
 
+/// Describe an 8x8 scaling list from its `next_scale` array.
 pub(crate) fn describe_scaling_list_8x8<W: SyntaxWrite>(
     w: &mut W,
-    list: &ScalingList<64>,
+    scales: &[u8; 64],
     index: u32,
 ) -> Result<(), W::Error> {
     let idx8 = index - 6;
@@ -396,90 +403,75 @@ pub(crate) fn describe_scaling_list_8x8<W: SyntaxWrite>(
             "ScalingList8x8[{idx8}], 64, UseDefaultScalingMatrix8x8Flag[{idx8}]"
         )),
     )?;
-    describe_scaling_list_body::<W, 64>(w, list)?;
+    describe_scaling_list_body::<W, 64>(w, scales)?;
     w.end_element()
 }
 
+/// Emit the delta_scale syntax elements for a scaling list given its `next_scale` array.
+///
+/// The `next_scale` values are the intermediate values from the H.264 spec's
+/// scaling list parsing algorithm. We reconstruct the `delta_scale` values that
+/// would have produced them.
 fn describe_scaling_list_body<W: SyntaxWrite, const S: usize>(
     w: &mut W,
-    list: &ScalingList<S>,
+    scales: &[u8; S],
 ) -> Result<(), W::Error> {
-    match list {
-        ScalingList::NotPresent => {
-            // Should not be called for NotPresent (filtered upstream)
-        }
-        ScalingList::UseDefault => {
-            // UseDefault: emit a single delta_scale = -8 so nextScale becomes 0
-            // at j=0, setting useDefaultScalingMatrixFlag = 1
-            w.begin_for(&format!("j = 0; j < {S}; j++"), &[])?;
-            w.for_iteration("j", 0)?;
-            w.begin_if("nextScale != 0", &[], true)?;
-            w.variable_length_field(&VariableLengthField {
-                name: "delta_scale",
-                descriptor: "se(v)",
-                value: Some(Value::Signed(-8)),
-                comment: Some("useDefaultScalingMatrixFlag = 1"),
-            })?;
-            w.end_if()?;
-            w.end_for()?;
-        }
-        ScalingList::List(values) => {
-            let deltas = compute_scaling_deltas(values);
-            w.begin_for(&format!("j = 0; j < {S}; j++"), &[])?;
-            let mut next_scale: i32 = 8;
-            for (j, delta) in deltas.iter().enumerate() {
-                w.for_iteration("j", j as u64)?;
-                let reading = next_scale != 0;
-                w.begin_if(
-                    "nextScale != 0",
-                    &[TermAnnotation {
-                        name: "nextScale",
-                        value: Value::Signed(next_scale as i64),
-                    }],
-                    reading,
-                )?;
-                if reading {
-                    w.variable_length_field(&VariableLengthField {
-                        name: "delta_scale",
-                        descriptor: "se(v)",
-                        value: Some(Value::Signed(*delta as i64)),
-                        comment: None,
-                    })?;
-                    let last_scale = if j == 0 {
-                        8
-                    } else {
-                        values[j - 1].get() as i32
-                    };
-                    next_scale = (last_scale + delta + 256) % 256;
+    // scales[0] == 0 means "use default scaling matrix"
+    if scales[0] == 0 {
+        w.begin_for(&format!("j = 0; j < {S}; j++"), &[])?;
+        w.for_iteration("j", 0)?;
+        w.begin_if("nextScale != 0", &[], true)?;
+        w.variable_length_field(&VariableLengthField {
+            name: "delta_scale",
+            descriptor: "se(v)",
+            value: Some(Value::Signed(-8)),
+            comment: Some("useDefaultScalingMatrixFlag = 1"),
+        })?;
+        w.end_if()?;
+        w.end_for()?;
+    } else {
+        // Reconstruct delta_scale values from the next_scale array.
+        // next_scale[j] = (last_scale + delta_scale + 256) % 256
+        w.begin_for(&format!("j = 0; j < {S}; j++"), &[])?;
+        let mut last_scale: i32 = 8;
+        for (j, &ns) in scales.iter().enumerate() {
+            w.for_iteration("j", j as u64)?;
+            let next_scale = ns as i32;
+            let reading = last_scale != 0 || j == 0;
+            w.begin_if(
+                "nextScale != 0",
+                &[TermAnnotation {
+                    name: "nextScale",
+                    value: Value::Signed(if j == 0 { 8 } else { last_scale as i64 }),
+                }],
+                reading,
+            )?;
+            if reading {
+                let prev = if j == 0 { 8 } else { last_scale };
+                let mut delta = next_scale - prev;
+                while delta > 127 {
+                    delta -= 256;
                 }
-                w.end_if()?;
+                while delta < -128 {
+                    delta += 256;
+                }
+                w.variable_length_field(&VariableLengthField {
+                    name: "delta_scale",
+                    descriptor: "se(v)",
+                    value: Some(Value::Signed(delta as i64)),
+                    comment: None,
+                })?;
             }
-            w.end_for()?;
+            w.end_if()?;
+            // A next_scale of 0 means the list is frozen from here on
+            if next_scale == 0 {
+                break;
+            }
+            last_scale = next_scale;
         }
+        w.end_for()?;
     }
     Ok(())
-}
-
-/// Compute delta_scale values that reproduce the given scaling list.
-fn compute_scaling_deltas<const S: usize>(values: &[NonZeroU8; S]) -> Vec<i32> {
-    let mut deltas = Vec::with_capacity(S);
-    let mut last_scale: i32 = 8;
-    for value in values {
-        let target = value.get() as i32;
-        let mut delta = target - last_scale;
-        // Normalize to [-128, 127]
-        while delta > 127 {
-            delta -= 256;
-        }
-        while delta < -128 {
-            delta += 256;
-        }
-        deltas.push(delta);
-        let next_scale = (last_scale + delta + 256) % 256;
-        // Since values are NonZeroU8, next_scale is always > 0
-        last_scale = next_scale;
-    }
-    deltas
 }
 
 fn describe_pic_order_cnt<W: SyntaxWrite>(
